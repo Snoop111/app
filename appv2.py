@@ -1,28 +1,75 @@
 # app.py
-import streamlit as st
-import boto3
+import os
+try:
+    import streamlit as st
+except Exception:  # pragma: no cover - allow running without streamlit
+    class _Dummy:
+        def __getattr__(self, name):
+            def _noop(*args, **kwargs):
+                return None
+
+            return _noop
+
+    st = _Dummy()
+try:
+    import boto3
+except Exception:  # pragma: no cover - allow running tests without boto3
+    boto3 = None  # type: ignore
 import time
 import logging
 from datetime import datetime
 from typing import Dict, List, Tuple, Optional, Any
-from botocore.exceptions import ClientError
+try:
+    from botocore.exceptions import ClientError, EndpointConnectionError
+except Exception:  # pragma: no cover - allow running tests without botocore
+    class ClientError(Exception):
+        pass
+
+    class EndpointConnectionError(Exception):
+        pass
 from dataclasses import dataclass
 
+# Load environment variables from a `.env` file if present
+def load_env() -> None:
+    """Simple .env loader to avoid external dependencies."""
+    if not os.path.exists('.env'):
+        return
+    with open('.env') as env_file:
+        for line in env_file:
+            if line.strip() and not line.strip().startswith('#'):
+                key, _, value = line.strip().partition('=')
+                if key and value:
+                    os.environ.setdefault(key, value)
+
+load_env()
+
 # Configure logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+def setup_logging() -> logging.Logger:
+    """Configure logging based on the LOG_LEVEL env var."""
+    level_name = os.getenv("LOG_LEVEL", "INFO").upper()
+    level = getattr(logging, level_name, logging.INFO)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+    return logging.getLogger(__name__)
+
+logger = setup_logging()
 
 # --- Configuration ---
 @dataclass
 class AppConfig:
-    """Application configuration settings."""
-    REGION: str = "us-east-1"
-    MODEL_ID: str = "claude-3-7-sonnet-20250219"
-    EMBEDDING_MODEL_ID: str = "amazon.titan-embed-text-v2:0"
-    KB_ID: str = "atlas_kb"
-    RAG_MODEL_ID: str = "claude-3-7-sonnet-20250219"
-    MAX_TOKENS: int = 500
-    RATE_LIMIT_PER_MINUTE: int = 10
+    """Application configuration settings loaded from environment."""
+
+    REGION: str = os.getenv("REGION", "us-east-1")
+    MODEL_ID: str = os.getenv("MODEL_ID", "claude-3-7-sonnet-20250219")
+    EMBEDDING_MODEL_ID: str = os.getenv(
+        "EMBEDDING_MODEL_ID", "amazon.titan-embed-text-v2:0"
+    )
+    KB_ID: str = os.getenv("KB_ID", "atlas_kb")
+    RAG_MODEL_ID: str = os.getenv("RAG_MODEL_ID", MODEL_ID)
+    MAX_TOKENS: int = int(os.getenv("MAX_TOKENS", 500))
+    RATE_LIMIT_PER_MINUTE: int = int(os.getenv("RATE_LIMIT_PER_MINUTE", 10))
 
 # Create config instance
 config = AppConfig()
@@ -43,7 +90,7 @@ def validate_config() -> None:
         "KB_ID": config.KB_ID,
         "RAG_MODEL_ID": config.RAG_MODEL_ID,
         "MAX_TOKENS": config.MAX_TOKENS,
-        "RATE_LIMIT_PER_MINUTE": config.RATE_LIMIT_PER_MINUTE
+        "RATE_LIMIT_PER_MINUTE": config.RATE_LIMIT_PER_MINUTE,
     }
     
     for name, value in config_dict.items():
@@ -60,16 +107,22 @@ def validate_config() -> None:
 validate_config()
 
 # --- AWS Clients ---
-def create_aws_clients() -> Tuple[boto3.client, boto3.client]:
+def create_aws_clients() -> Tuple[Optional[Any], Optional[Any]]:
     """
     Create and return AWS Bedrock clients.
     
     Returns:
         Tuple of (bedrock_runtime_client, bedrock_agent_runtime_client)
     """
+    if boto3 is None:
+        logger.warning("boto3 is not available; AWS clients are disabled")
+        return None, None
     try:
         bedrock = boto3.client("bedrock-runtime", region_name=config.REGION)
-        bedrock_kb = boto3.client("bedrock-agent-runtime", region_name=config.REGION)
+        bedrock_kb = boto3.client(
+            "bedrock-agent-runtime", region_name=config.REGION
+        )
+        logger.info(f"AWS clients created in region {config.REGION}")
         return bedrock, bedrock_kb
     except Exception as e:
         logger.error(f"Failed to create AWS clients: {str(e)}")
@@ -111,8 +164,13 @@ class RateLimiter:
         if len(self.calls) >= self.max_calls:
             wait_time = 60 - (now - self.calls[0])
             logger.warning(f"Rate limit exceeded, waiting {wait_time:.1f} seconds")
-            st.warning(f"Rate limit exceeded. Please wait {wait_time:.1f} seconds.")
-            time.sleep(wait_time)
+            placeholder = st.empty()
+            for remaining in range(int(wait_time), 0, -1):
+                placeholder.warning(
+                    f"Rate limit exceeded. Waiting {remaining}s..."
+                )
+                time.sleep(1)
+            placeholder.empty()
             self.calls.pop(0)
         
         self.calls.append(now)
@@ -120,16 +178,18 @@ class RateLimiter:
 rate_limiter = RateLimiter(config.RATE_LIMIT_PER_MINUTE)
 
 # --- Helper Functions ---
+try:
+    import tiktoken  # type: ignore
+    ENCODER = tiktoken.encoding_for_model(config.MODEL_ID)
+except Exception:  # pragma: no cover - fallback if tiktoken isn't installed
+    ENCODER = None
+
+
 def estimate_tokens(text: str) -> int:
-    """
-    Simple token estimation based on character count.
-    
-    Args:
-        text: Input text to estimate tokens for
-        
-    Returns:
-        Estimated number of tokens (1 token ≈ 4 characters)
-    """
+    """Estimate token count using tiktoken when available."""
+    if ENCODER:
+        return len(ENCODER.encode(text))
+    # Rough fallback: assume 1 token ≈ 4 characters
     return len(text) // 4
 
 def validate_token_limit(text: str) -> bool:
@@ -231,6 +291,7 @@ def chat_with_kb(
     except ClientError as e:
         error_code = e.response['Error']['Code']
         error_message = e.response['Error']['Message']
+        request_id = e.response.get('ResponseMetadata', {}).get('RequestId')
         
         if error_code == 'ThrottlingException':
             logger.warning(f"AWS throttling: {error_message}")
@@ -240,8 +301,14 @@ def chat_with_kb(
             logger.error(f"Validation error: {error_message}")
             return f"Invalid request: {error_message}", []
         else:
-            logger.error(f"AWS error ({error_code}): {error_message}")
+            logger.error(
+                f"AWS error ({error_code}): {error_message} [RequestId: {request_id}]"
+            )
             return f"AWS service error: {error_message}", []
+
+    except EndpointConnectionError as e:
+        logger.error(f"Network error: {str(e)}")
+        return "Network error communicating with AWS services.", []
             
     except ValueError as e:
         logger.error(f"Validation error: {str(e)}")
